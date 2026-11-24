@@ -44,13 +44,20 @@
     return n;
   }
   // Recompute a row's implied value from the snapshot figures, exactly as
-  // lib/model.ts does: TVL x 0.205, times the growth, age and breadth factors.
+  // lib/model.ts does: TVL x the row's fitted multiple, times the growth,
+  // age and breadth factors. The multiple is the row's own category
+  // multiple (or the global median when its category has too few traded
+  // protocols), carried in the row's model block.
   function impliedOf(r) {
     var growth = Math.min(50, Math.max(-30, r.change_7d === null ? 0 : r.change_7d));
     var ageY = r.age_days === null ? 0 : r.age_days / 365;
     var ageM = 1 + 0.1 * Math.min(ageY, 3);
     var breadthM = 1 + 0.03 * Math.min(Math.max(r.chains.length - 1, 0), 10);
-    return Math.max(1, Math.round(r.tvl_usd * 0.205 * (1 + growth / 100) * ageM * breadthM));
+    var mult = (r.model && isFinite(r.model.base_multiple)) ? r.model.base_multiple : DATA.base_multiple;
+    return Math.max(1, Math.round(r.tvl_usd * mult * (1 + growth / 100) * ageM * breadthM));
+  }
+  function multText(m) {
+    return m.toFixed(3).replace(/0$/, '');
   }
 
   var cats = [];
@@ -90,14 +97,20 @@
     wrap.appendChild(head);
 
     var stats = el('div', 'stats');
-    [['198', 'protocols ranked'], ['40', 'on the watchlist'], [usd(DATA.rows.reduce(function (s, r) { return s + r.tvl_usd; }, 0)), 'combined TVL'], [usd(DATA.rows[0].implied_value_usd), 'top implied value']].forEach(function (s) {
+    [['' + DATA.rows.length, 'protocols ranked'], ['' + DATA.watchlist_size, 'on the watchlist'], [usd(DATA.rows.reduce(function (s, r) { return s + r.tvl_usd; }, 0)), 'combined TVL'], [usd(DATA.rows[0].implied_value_usd), 'top implied value']].forEach(function (s) {
       stats.appendChild(el('div', 'stat', '<b>' + s[0] + '</b><span>' + s[1] + '</span>'));
     });
     wrap.appendChild(stats);
 
+    var mults = DATA.multiples || { global: DATA.base_multiple, global_n: 0, by_category: [] };
+    var boardCats = {};
+    DATA.rows.forEach(function (r) { if (r.category) boardCats[r.category] = true; });
+    var fittedList = mults.by_category.filter(function (c) { return boardCats[c.category]; });
     var model = el('div', 'model', '<b style="color:var(--ink)">How the value is worked out.</b> ' +
-      'implied value = TVL &times; <code>0.205</code> &times; growth factor &times; age factor &times; breadth factor. ' +
-      '0.205 is the median market-cap / TVL of the 129 token protocols in the snapshot. Growth is the 7-day TVL change, clamped to &minus;30%..+50%. ' +
+      'implied value = TVL &times; <code>multiple</code> &times; growth factor &times; age factor &times; breadth factor. ' +
+      'The multiple is fitted from the snapshot itself: the median market-cap / TVL of the ' + mults.global_n + ' protocols whose token already trades is <code>' + multText(mults.global) + '</code>, and each category with at least five traded protocols gets its own multiple, shrunk toward that global number so a thin category cannot drag the board on noise' +
+      (fittedList.length ? ' &mdash; ' + fittedList.map(function (c) { return esc(c.category) + ' <code>' + multText(c.multiple) + '</code> (' + c.traded_n + ' traded)'; }).join(', ') : '') +
+      '. Growth is the 7-day TVL change, clamped to &minus;30%..+50%. ' +
       'Age adds 10% a year running with no token, capped at 3 years. Breadth adds 3% per extra chain, capped at 10. ' +
       'No name is special-cased. Exchanges, bridges, liquid-staking products and wrapped or staked products are excluded, as are versioned pools &mdash; they are not launches that have not happened yet.');
     wrap.appendChild(model);
@@ -155,7 +168,9 @@
           '<div><b>TVL</b><br>' + usd(r.tvl_usd) + '</div>' +
           '<div><b>7-day change</b><br>' + pct(r.change_7d) + '</div>' +
           '<div><b>Implied value</b><br>' + usd(r.implied_value_usd) + ' (recomputed in this page: ' + usd(impliedOf(r)) + ')</div>' +
-          '<div><b>Running with no token</b><br>' + age(r.age_days) + (r.listed_at ? ' since ' + esc(r.listed_at) : '') + '</div>'));
+          '<div><b>Running with no token</b><br>' + age(r.age_days) + (r.listed_at ? ' since ' + esc(r.listed_at) : '') + '</div>' +
+          '<div><b>Value multiple</b><br>' + multText(r.model.base_multiple) + '&times; TVL &mdash; ' + (r.model.multiple_source === 'category' ? 'fitted from ' + r.model.multiple_n + ' traded ' + esc(r.category || '') + ' protocols' : 'global median of ' + r.model.multiple_n + ' traded protocols') + '</div>' +
+          '<div><b>Factors</b><br>growth &times;' + r.model.growth_multiplier + ' &middot; age &times;' + r.model.age_multiplier + ' &middot; breadth &times;' + r.model.breadth_multiplier + '</div>'));
         det.appendChild(el('h3', '', 'How to farm it'));
         var ol = el('ol');
         r.farm_steps.forEach(function (s) { ol.appendChild(el('li', '', esc(s))); });

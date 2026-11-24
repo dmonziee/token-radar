@@ -11,10 +11,20 @@ A token launch radar for make.fun's [`token-radar-01`](https://make.fun/bounty/t
 Implied value follows only from the snapshot's own figures:
 
 ```
-implied = TVL x 0.205 x growth x age x breadth
+implied = TVL x multiple(category) x growth x age x breadth
 ```
 
-- **0.205** is the median market-cap / TVL of the 129 token protocols in the snapshot.
+- **Multiple**: fitted per category from the snapshot itself. The median
+  market-cap / TVL of the 128 protocols whose token already trades is
+  **0.214**; each category with at least five traded protocols gets its
+  own multiple, shrunk toward that global number so a thin category
+  cannot drag the board on noise — Basis Trading 0.395 (7 traded),
+  Dexes 0.281 (11), RWA 0.243 (9), Yield 0.203 (9), Lending 0.165 (15).
+  Categories with fewer traded protocols use the global 0.214.
+  Checked by 5-fold cross-validation on the 128 traded protocols, the
+  per-category fit lands closer to their own market caps than one global
+  multiple (median absolute log10 error 0.699 vs 0.719, winning 36 of 40
+  repeats), while the top 20 of the board keeps 19 of 20 names.
 - **Growth** is the 7-day TVL change, clamped to -30%..+50%.
 - **Age** adds 10% a year running with no token, capped at 3 years.
 - **Breadth** adds 3% per extra chain, capped at 10 chains.

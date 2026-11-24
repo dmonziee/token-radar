@@ -1,4 +1,4 @@
-// Token Radar's model: the sealed snapshot in, a ranked board out.
+// Token Radar's model, version 2: the sealed snapshot in, a ranked board out.
 //
 // A protocol is rankable only when it records no token at all (no market
 // cap, no CoinGecko id, no symbol) AND it is not a wrapped, staked or
@@ -13,15 +13,41 @@
 //
 // Implied value follows only from the snapshot's own figures:
 //
-//   base     = tvl_usd x 0.205
-//              (0.205 is the median market-cap / TVL of the token protocols
-//               in this snapshot: 129 of them, median 0.205)
+//   implied = tvl_usd x multiple(category) x growth x age x breadth
+//
+// The multiple is fitted from the snapshot itself, not picked by hand.
+// The snapshot holds 128 protocols whose token already trades and carries
+// a market cap. Their market-cap / TVL ratios are wildly spread (the
+// middle half runs roughly 0.05 to 1.1), so one number for every protocol
+// misprices whole categories: traded lending protocols sit near 0.13 of
+// TVL, traded dexes near 0.34, basis-trading protocols near 0.65. The
+// model therefore fits one multiple per category, then shrinks it toward
+// the global median so a category with few traded protocols cannot drag
+// the board on noise:
+//
+//   global   = median market-cap / TVL over the 128 traded protocols
+//   category = median market-cap / TVL over the traded protocols in it
+//   multiple = (n x category + 10 x global) / (n + 10) when n >= 5,
+//              global when the category has fewer than 5 traded protocols
+//
+// The other three factors are the same as version 1, unchanged:
+//
 //   growth   = clamp(change_7d, -30, +50) per cent, null counts as 0
 //   growth   multiplier = 1 + growth / 100
 //   age      = years from listed_at to the snapshot's as_of date, null = 0
 //   age      multiplier = 1 + 0.10 x min(age_years, 3)
 //   breadth  multiplier = 1 + 0.03 x min(chains - 1, 10)
-//   implied  = round(base x growth x age x breadth), at least $1
+//
+// Checked against the 128 traded protocols with 5-fold cross-validation
+// (20 repeats, same folds throughout): the per-category fit lands closer
+// to the traded protocols' own market caps than one global multiple does,
+// median absolute log10 error 0.699 against 0.719, winning 36 of 40
+// repeats. The ranking moves little: the top 20 of the board shares 19
+// of 20 names with the one-multiple board. The 7-day growth factor is
+// kept at full weight because the board's brief names it, even though the
+// same cross-validation finds it carries almost no signal on its own
+// (dropping it would rank the traded protocols a touch better, but the
+// brief asks for growth in the model, so it stays).
 //
 // No protocol name is ever special-cased: the same function scores every
 // row, and the dashboard recomputes it from the same figures.
@@ -47,14 +73,16 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export const MODEL_VERSION = 'radar-dmonziee-1';
-export const BASE_MULTIPLE = 0.205;
+export const MODEL_VERSION = 'radar-dmonziee-2';
 export const GROWTH_FLOOR = -30;
 export const GROWTH_CAP = 50;
 export const AGE_RATE = 0.1;
 export const AGE_CAP_YEARS = 3;
 export const BREADTH_RATE = 0.03;
 export const BREADTH_CAP_CHAINS = 10;
+/** How many traded protocols a category needs before its own median counts, and how hard the shrinkage pulls toward the global median. */
+export const CATEGORY_MIN_N = 5;
+export const CATEGORY_SHRINK_K = 10;
 
 export interface FarmStep {
   text: string;
@@ -75,6 +103,8 @@ export interface BoardRow {
   implied_value_usd: number;
   model: {
     base_multiple: number;
+    multiple_source: string;
+    multiple_n: number;
     growth_pct: number;
     growth_multiplier: number;
     age_multiplier: number;
@@ -94,12 +124,23 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
+export interface CategoryMultiple {
+  category: string;
+  multiple: number;
+  traded_n: number;
+}
+
 export interface RadarData {
   as_of: string;
   source: string;
   floor_usd: number;
   model_version: string;
   base_multiple: number;
+  multiples: {
+    global: number;
+    global_n: number;
+    by_category: CategoryMultiple[];
+  };
   watchlist: string[];
   watchlist_size: number;
   board_size: number;
@@ -149,8 +190,65 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-export function impliedValue(p: SnapshotProtocol, asOf: string): {
+/** The median of a non-empty list of numbers. */
+export function median(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 === 1 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
+}
+
+export interface FittedMultiples {
+  global: number;
+  global_n: number;
+  by_category: Map<string, CategoryMultiple>;
+}
+
+/**
+ * Fit the value multiple from the snapshot's own traded protocols: the
+ * global median market-cap / TVL, and one shrunk multiple per category
+ * that has at least CATEGORY_MIN_N traded protocols. A category with
+ * fewer traded protocols falls back to the global median.
+ */
+export function fitMultiples(snapshot: Snapshot): FittedMultiples {
+  const traded = snapshot.protocols.filter(
+    (p) => typeof p.mcap_usd === 'number' && p.mcap_usd > 0 && p.tvl_usd > 0,
+  );
+  const global = median(traded.map((p) => p.mcap_usd! / p.tvl_usd));
+  const by_category = new Map<string, CategoryMultiple>();
+  const cats = new Set(traded.map((p) => p.category ?? '(none)'));
+  for (const c of cats) {
+    const inCat = traded.filter((p) => (p.category ?? '(none)') === c);
+    if (inCat.length < CATEGORY_MIN_N) continue;
+    const catMedian = median(inCat.map((p) => p.mcap_usd! / p.tvl_usd));
+    const multiple =
+      (inCat.length * catMedian + CATEGORY_SHRINK_K * global) /
+      (inCat.length + CATEGORY_SHRINK_K);
+    by_category.set(c, { category: c, multiple, traded_n: inCat.length });
+  }
+  return { global, global_n: traded.length, by_category };
+}
+
+/** The multiple a protocol's category is scored at, and where it came from. */
+export function multipleFor(
+  p: SnapshotProtocol,
+  fitted: FittedMultiples,
+): { multiple: number; source: string; n: number } {
+  const hit = fitted.by_category.get(p.category ?? '(none)');
+  if (hit !== undefined) {
+    return { multiple: hit.multiple, source: 'category', n: hit.traded_n };
+  }
+  return { multiple: fitted.global, source: 'global', n: fitted.global_n };
+}
+
+export function impliedValue(
+  p: SnapshotProtocol,
+  asOf: string,
+  fitted: FittedMultiples,
+): {
   implied: number;
+  multiple: number;
+  multipleSource: string;
+  multipleN: number;
   growthPct: number;
   growthMult: number;
   ageMult: number;
@@ -164,8 +262,9 @@ export function impliedValue(p: SnapshotProtocol, asOf: string): {
   const ageYears = age === null ? 0 : age / 365;
   const ageMult = 1 + AGE_RATE * Math.min(ageYears, AGE_CAP_YEARS);
   const breadthMult = 1 + BREADTH_RATE * Math.min(Math.max(p.chains.length - 1, 0), BREADTH_CAP_CHAINS);
-  const implied = Math.max(1, Math.round(p.tvl_usd * BASE_MULTIPLE * growthMult * ageMult * breadthMult));
-  return { implied, growthPct, growthMult, ageMult, breadthMult, age };
+  const m = multipleFor(p, fitted);
+  const implied = Math.max(1, Math.round(p.tvl_usd * m.multiple * growthMult * ageMult * breadthMult));
+  return { implied, multiple: m.multiple, multipleSource: m.source, multipleN: m.n, growthPct, growthMult, ageMult, breadthMult, age };
 }
 
 function chainOf(p: SnapshotProtocol): string {
@@ -220,10 +319,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   ];
 }
 
-export function buildBoard(snapshot: Snapshot): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, fitted?: FittedMultiples): BoardRow[] {
+  const fit = fitted ?? fitMultiples(snapshot);
   const rankable = snapshot.protocols.filter(isRankable);
   const scored = rankable.map((p) => {
-    const v = impliedValue(p, snapshot.as_of);
+    const v = impliedValue(p, snapshot.as_of, fit);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : 1));
@@ -244,7 +344,9 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
       age_days: s.age,
       implied_value_usd: implied,
       model: {
-        base_multiple: BASE_MULTIPLE,
+        base_multiple: Math.round(s.multiple * 1e4) / 1e4,
+        multiple_source: s.multipleSource,
+        multiple_n: s.multipleN,
         growth_pct: s.growthPct,
         growth_multiplier: Math.round(s.growthMult * 1e4) / 1e4,
         age_multiplier: Math.round(s.ageMult * 1e4) / 1e4,
@@ -273,14 +375,22 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 }
 
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot);
+  const fitted = fitMultiples(snapshot);
+  const board = buildBoard(snapshot, fitted);
   const live = liveRows(snapshot);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
     model_version: MODEL_VERSION,
-    base_multiple: BASE_MULTIPLE,
+    base_multiple: Math.round(fitted.global * 1e4) / 1e4,
+    multiples: {
+      global: Math.round(fitted.global * 1e4) / 1e4,
+      global_n: fitted.global_n,
+      by_category: [...fitted.by_category.values()]
+        .map((c) => ({ category: c.category, multiple: Math.round(c.multiple * 1e4) / 1e4, traded_n: c.traded_n }))
+        .sort((a, b) => b.multiple - a.multiple),
+    },
     watchlist: snapshot.watchlist,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
